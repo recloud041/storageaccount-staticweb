@@ -1,0 +1,84 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  name: 'gcp-agent-ads'   # your self-hosted agent pool
+
+variables:
+  azureServiceConnection: 'staticweb-dep'
+  tfStorageAccount: 'staticwebsatya01'
+  tfResourceGroup: 'rg-static-website'
+  subscriptionId: 'e3a5dfbb-4823-4a47-b250-3479d2a06234'
+
+stages:
+  - stage: CheckInfra
+    displayName: "Check if RG + Storage Account exist"
+    jobs:
+      - job: Check
+        steps:
+          - task: AzureCLI@2
+            name: checkInfra
+            displayName: "Check RG and SA existence"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Checking if RG $(tfResourceGroup) and SA $(tfStorageAccount) exist..."
+                if az group show --name $(tfResourceGroup) >/dev/null 2>&1 && \
+                   az storage account show --name $(tfStorageAccount) --resource-group $(tfResourceGroup) >/dev/null 2>&1; then
+                  echo "Infra already exists."
+                  echo "##vso[task.setvariable variable=infraExists;isOutput=true]true"
+                else
+                  echo "Infra does not exist."
+                  echo "##vso[task.setvariable variable=infraExists;isOutput=true]false"
+                fi
+
+  - stage: Terraform
+    displayName: "Provision Infrastructure"
+    dependsOn: CheckInfra
+    condition: eq(dependencies.CheckInfra.outputs['Check.checkInfra.infraExists'], 'false')
+    jobs:
+      - job: DeployInfra
+        steps:
+          - task: Bash@3
+            displayName: 'Terraform Init'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              script: terraform init
+
+          - task: Bash@3
+            displayName: 'Terraform Apply'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              script: terraform apply -auto-approve
+
+  - stage: DeployWebsite
+    displayName: "Upload Website Content"
+    dependsOn: [CheckInfra, Terraform]
+    condition: |
+      or(
+        eq(dependencies.CheckInfra.outputs['Check.checkInfra.infraExists'], 'true'),
+        succeeded('Terraform')
+      )
+    jobs:
+      - job: UploadFiles
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Upload files to Storage Account'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Uploading website files to $(tfStorageAccount)"
+                az storage blob upload-batch \
+                  --account-name $(tfStorageAccount) \
+                  --auth-mode login \
+                  -s $(System.DefaultWorkingDirectory)/website \
+                  -d \$web \
+                  --overwrite
